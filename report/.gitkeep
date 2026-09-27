@@ -1,0 +1,2 @@
+# Scanner output directory
+# findings.json, npm_audit.json, pip_audit.json are written here by run.sh

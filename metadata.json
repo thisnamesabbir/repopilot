@@ -1,0 +1,6 @@
+{
+  "name": "RepoPilot",
+  "description": "Your AI teammate for real-world codebases.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
