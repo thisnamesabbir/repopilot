@@ -267,13 +267,35 @@ You can ask me to implement features, review security, fix test errors, or run:
         }),
       });
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to get AI assistant response.');
+      const responseBody = await res.text();
+      let data: any;
+      try {
+        data = responseBody ? JSON.parse(responseBody) : null;
+      } catch {
+        data = null;
       }
 
-      const data = await res.json();
-      const plan: CodePlanResponse = data.plan;
+      if (!res.ok) {
+        const apiError = typeof data?.error === 'string' ? data.error : '';
+        const bodyHint = !apiError && responseBody
+          ? responseBody.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)
+          : '';
+        throw new Error(apiError || `Chat API returned HTTP ${res.status}${bodyHint ? `: ${bodyHint}` : ` ${res.statusText}`}.`);
+      }
+
+      const responsePlan = data?.plan;
+      if (
+        !responsePlan ||
+        typeof responsePlan !== 'object' ||
+        typeof responsePlan.understanding !== 'string' ||
+        !Array.isArray(responsePlan.filesAffected) ||
+        !Array.isArray(responsePlan.plan) ||
+        !Array.isArray(responsePlan.changes || responsePlan.codeChanges)
+      ) {
+        throw new Error(`Chat API returned an invalid response (HTTP ${res.status}); expected a structured plan.`);
+      }
+
+      const plan: CodePlanResponse = responsePlan;
 
       const isInsufficient = Boolean(
         plan.insufficientContext || 
