@@ -20,6 +20,7 @@ const DESTRUCTIVE =
 
 export async function run(b: Boundary, spec: RunSpec): Promise<ToolResult> {
   const r = makeResult(spec.tool, spec.operation);
+  b.verifyNoSymlinkEscape(spec.cwd ?? '.');
   const cwd = spec.cwd ? b.resolve(spec.cwd) : b.root;
 
   const joined = `${spec.binary} ${spec.args.join(" ")}`;

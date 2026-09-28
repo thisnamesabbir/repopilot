@@ -13,8 +13,20 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const GITHUB_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_GITHUB_FILE_BYTES = 40_000;
 
 app.use(express.json({ limit: '25mb' }));
+app.use('/api', (req: Request, res: Response, next) => {
+  if (
+    req.method === 'POST' &&
+    (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))
+  ) {
+    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+  }
+
+  next();
+});
 
 const apiKey = process.env.GEMINI_API_KEY;
 let aiClient: GoogleGenAI | null = null;
@@ -28,6 +40,38 @@ if (apiKey) {
       },
     },
   });
+}
+
+function logGeminiFailure(error: unknown) {
+  const status =
+    typeof error === 'object' && error !== null && 'status' in error &&
+    typeof error.status === 'number'
+      ? error.status
+      : undefined;
+
+  console.error('Gemini API request failed:', {
+    name: error instanceof Error ? error.name : 'UnknownError',
+    status,
+  });
+}
+
+function sanitizeRepoFiles(files: unknown): { path: string; content: string }[] {
+  if (!Array.isArray(files)) return [];
+
+  return files
+    .filter((file): file is { path: string; content: string } =>
+      Boolean(
+        file &&
+        typeof file === 'object' &&
+        typeof file.path === 'string' &&
+        typeof file.content === 'string'
+      )
+    )
+    .slice(0, 50)
+    .map(file => ({
+      path: file.path.slice(0, 500),
+      content: file.content.slice(0, 30_000),
+    }));
 }
 
 // Health check endpoint
@@ -50,9 +94,7 @@ app.post('/api/repo/analyze', async (req: Request, res: Response) => {
     }
 
     // Sanitize and validate files
-    const validFiles = files
-      .filter((f: any) => f && typeof f.path === 'string' && typeof f.content === 'string')
-      .slice(0, 50);
+    const validFiles = sanitizeRepoFiles(files);
 
     if (validFiles.length === 0) {
       return res.status(400).json({ error: 'Files array contains no valid text content.' });
@@ -124,8 +166,9 @@ Return ONLY valid JSON.`;
           const rawText = response.text || '';
           const parsed = JSON.parse(rawText);
           return res.json({ analysis: parsed, source: modelName });
-        } catch (_geminiError: any) {
+        } catch (geminiError) {
           // Model temporarily unavailable or quota reached; proceed to next model or rule-based engine
+          logGeminiFailure(geminiError);
         }
       }
     }
@@ -212,9 +255,12 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
       return res.status(400).json({ error: 'A valid non-empty message string is required.' });
     }
+    if (message.length > 10_000) {
+      return res.status(400).json({ error: 'Message must be at most 10000 characters.' });
+    }
 
-    const files = Array.isArray(repoContext?.files) ? repoContext.files : [];
-    const repoName = repoContext?.name || 'Codebase';
+    const files = sanitizeRepoFiles(repoContext?.files);
+    const repoName = typeof repoContext?.name === 'string' ? repoContext.name.slice(0, 200) : 'Codebase';
     const trimmedMsg = message.trim();
 
     // Check for Insufficient Repository Context
@@ -363,10 +409,15 @@ Return ONLY valid JSON.`;
       const contentsPayload: any[] = [];
       if (Array.isArray(history)) {
         for (const item of history.slice(-6)) {
-          if (item && item.content) {
+          if (
+            item &&
+            (item.role === 'user' || item.role === 'assistant') &&
+            typeof item.content === 'string' &&
+            item.content.length > 0
+          ) {
             contentsPayload.push({
               role: item.role === 'assistant' ? 'model' : 'user',
-              parts: [{ text: typeof item.content === 'string' ? item.content : JSON.stringify(item.content) }]
+              parts: [{ text: item.content.slice(0, 10_000) }]
             });
           }
         }
@@ -449,8 +500,9 @@ Return ONLY valid JSON.`;
           };
 
           return res.json({ plan: fullStructuredPlan, source: modelToCall });
-        } catch (_geminiError: any) {
+        } catch (geminiError) {
           // Model temporarily unavailable or quota reached; proceed to next model or architecture fallback
+          logGeminiFailure(geminiError);
         }
       }
     }
@@ -732,7 +784,7 @@ app.post('/api/chat/explain-change', async (req: Request, res: Response) => {
   try {
     const { filePath, description, oldCode = '', newCode = '', diff = '', userPrompt = '' } = req.body;
 
-    if (!filePath) {
+    if (typeof filePath !== 'string' || filePath.trim().length === 0) {
       return res.status(400).json({ error: 'filePath is required.' });
     }
 
@@ -811,6 +863,9 @@ app.post('/api/diff', (req: Request, res: Response) => {
   if (!filePath || typeof filePath !== 'string' || filePath.trim().length === 0) {
     return res.status(400).json({ error: 'filePath is required and must be a non-empty string.' });
   }
+  if (/[\r\n\0]/.test(filePath)) {
+    return res.status(400).json({ error: 'filePath cannot contain line breaks or null characters.' });
+  }
   if (typeof oldCode !== 'string') {
     return res.status(400).json({ error: 'oldCode is required and must be a string.' });
   }
@@ -836,12 +891,16 @@ app.post('/api/tests/analyze-error', async (req: Request, res: Response) => {
     if (!errorLog || typeof errorLog !== 'string') {
       return res.status(400).json({ error: 'Error log text is required.' });
     }
+    if (errorLog.length > 100_000 || !Array.isArray(files)) {
+      return res.status(400).json({ error: 'Error log is too large or files must be an array.' });
+    }
+    const validFiles = sanitizeRepoFiles(files);
 
     if (aiClient) {
       const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
       for (const modelToCall of modelsToTry) {
         try {
-          const fileNames = files.map((f: any) => f.path).join(', ');
+          const fileNames = validFiles.map((f: any) => f.path).join(', ');
           const prompt = `You are RepoPilot Test Debugger. A developer encountered the following test/runtime error log:
 \`\`\`
 ${errorLog}
@@ -870,8 +929,9 @@ Return ONLY valid JSON.`;
           const raw = response.text || '';
           const parsed = JSON.parse(raw);
           return res.json({ diagnostic: parsed, source: modelToCall });
-        } catch (_geminiError: any) {
+        } catch (geminiError) {
           // Model temporarily unavailable or quota reached; continue to next model or rule-based engine
+          logGeminiFailure(geminiError);
         }
       }
     }
@@ -928,11 +988,14 @@ Return ONLY valid JSON.`;
 // FEATURE 4: Run Test Suite Endpoint
 app.post('/api/tests/run', (req: Request, res: Response) => {
   const { files = [] } = req.body;
+  if (!Array.isArray(files)) {
+    return res.status(400).json({ error: 'files must be an array.' });
+  }
 
   // Real checks on provided files: syntax checking, required modules
-  const hasApp = files.some((f: any) => f.path.includes('App'));
-  const hasServer = files.some((f: any) => f.path.includes('server'));
-  const hasAuth = files.some((f: any) => f.path.includes('auth'));
+  const hasApp = files.some((f: any) => typeof f?.path === 'string' && f.path.includes('App'));
+  const hasServer = files.some((f: any) => typeof f?.path === 'string' && f.path.includes('server'));
+  const hasAuth = files.some((f: any) => typeof f?.path === 'string' && f.path.includes('auth'));
 
   // Realistic test results for TaskFlow
   const tests: {
@@ -1018,15 +1081,19 @@ app.post('/api/security/review', async (req: Request, res: Response) => {
   try {
     const { files = [] } = req.body;
 
-    if (!files || files.length === 0) {
+    if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ error: 'No repository files provided for security review.' });
+    }
+    const validFiles = sanitizeRepoFiles(files);
+    if (validFiles.length === 0) {
+      return res.status(400).json({ error: 'Files array contains no valid text content.' });
     }
 
     if (aiClient) {
       const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
       for (const modelToCall of modelsToTry) {
         try {
-          const repoSnippet = files
+          const repoSnippet = validFiles
             .map((f: any) => `Path: ${f.path}\n\`\`\`\n${(f.content || '').slice(0, 1200)}\n\`\`\``)
             .join('\n\n');
 
@@ -1079,8 +1146,9 @@ Return ONLY valid JSON.`;
           const raw = response.text || '';
           const parsed = JSON.parse(raw);
           return res.json({ report: parsed, scannerType: 'Gemini Static Analysis Engine' });
-        } catch (_geminiError: any) {
+        } catch (geminiError) {
           // Model temporarily unavailable or quota reached; continue to next model or static rule scanner
+          logGeminiFailure(geminiError);
         }
       }
     }
@@ -1089,7 +1157,7 @@ Return ONLY valid JSON.`;
     const findings: any[] = [];
 
     // Rule 1: Check for fallback secrets in auth files
-    const authFile = files.find((f: any) => f.path.includes('auth.ts') || f.path.includes('middleware/auth'));
+    const authFile = validFiles.find((f: any) => f.path.includes('auth.ts') || f.path.includes('middleware/auth'));
     if (authFile && authFile.content?.includes('dev-secret-key-change-me')) {
       findings.push({
         id: 'sec_secret_fallback',
@@ -1108,7 +1176,7 @@ Return ONLY valid JSON.`;
     }
 
     // Rule 2: Check for CORS origin: '*' with credentials
-    const serverFile = files.find((f: any) => f.path.includes('server/index.ts') || f.path.includes('server.ts'));
+    const serverFile = validFiles.find((f: any) => f.path.includes('server/index.ts') || f.path.includes('server.ts'));
     if (serverFile && serverFile.content?.includes("origin: '*'") && serverFile.content?.includes('credentials: true')) {
       findings.push({
         id: 'sec_cors_wildcard',
@@ -1127,7 +1195,7 @@ Return ONLY valid JSON.`;
     }
 
     // Rule 3: Client-side unprotected dashboard
-    const clientAppFile = files.find((f: any) => f.path.includes('src/App.tsx'));
+    const clientAppFile = validFiles.find((f: any) => f.path.includes('src/App.tsx'));
     if (clientAppFile && clientAppFile.content?.includes('Dashboard user={currentUser}') && !clientAppFile.content?.includes('ProtectedRoute')) {
       findings.push({
         id: 'sec_client_route_guard',
@@ -1146,7 +1214,7 @@ Return ONLY valid JSON.`;
     }
 
     // Rule 4: Long-lived token expiration
-    const routesAuthFile = files.find((f: any) => f.path.includes('routes/auth.ts'));
+    const routesAuthFile = validFiles.find((f: any) => f.path.includes('routes/auth.ts'));
     if (routesAuthFile && routesAuthFile.content?.includes("expiresIn: '8h'")) {
       findings.push({
         id: 'sec_token_expiration',
@@ -1184,18 +1252,26 @@ Return ONLY valid JSON.`;
 // Import GitHub Public Repository
 app.get('/api/github/fetch', async (req: Request, res: Response) => {
   try {
-    const repoQuery = (req.query.repo as string || '').trim();
+    const repoParam = req.query.repo;
+    if (typeof repoParam !== 'string') {
+      return res.status(400).json({ error: 'Please specify repo in owner/repo format (e.g. facebook/react)' });
+    }
+    const repoQuery = repoParam.trim();
     if (!repoQuery || !repoQuery.includes('/')) {
       return res.status(400).json({ error: 'Please specify repo in owner/repo format (e.g. facebook/react)' });
     }
 
-    const [owner, repo] = repoQuery.split('/');
-    const branch = (req.query.branch as string) || 'main';
+    const [owner, repo, extraPart] = repoQuery.split('/');
+    const branchParam = req.query.branch;
+    if (branchParam !== undefined && typeof branchParam !== 'string') {
+      return res.status(400).json({ error: 'Branch must be a single branch name.' });
+    }
+    const branch = branchParam || 'main';
 
     // Strict validation to prevent SSRF and injection
     const nameRegex = /^[a-zA-Z0-9_.-]+$/;
     const branchRegex = /^[a-zA-Z0-9/_.-]+$/;
-    if (!owner || !repo || !nameRegex.test(owner) || !nameRegex.test(repo) || !branchRegex.test(branch)) {
+    if (extraPart !== undefined || !owner || !repo || !nameRegex.test(owner) || !nameRegex.test(repo) || !branchRegex.test(branch)) {
       return res.status(400).json({ error: 'Invalid repository name or branch format. Only alphanumeric characters, hyphens, and underscores are allowed.' });
     }
 
@@ -1210,7 +1286,10 @@ app.get('/api/github/fetch', async (req: Request, res: Response) => {
       headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     }
 
-    const treeResponse = await fetch(treeUrl, { headers });
+    const treeResponse = await fetch(treeUrl, {
+      headers,
+      signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
+    });
     if (!treeResponse.ok) {
       if (treeResponse.status === 403 || treeResponse.status === 429) {
         return res.status(429).json({
@@ -1220,10 +1299,13 @@ app.get('/api/github/fetch', async (req: Request, res: Response) => {
       // Fallback: try "master" branch
       if (branch === 'main') {
         const masterUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/master?recursive=1`;
-        const masterRes = await fetch(masterUrl, { headers });
+        const masterRes = await fetch(masterUrl, {
+          headers,
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
+        });
         if (masterRes.ok) {
           const masterData = await masterRes.json();
-          return processGitHubTree(masterData, owner, repo, 'master', res, headers);
+          return await processGitHubTree(masterData, owner, repo, 'master', res);
         }
       }
       return res.status(treeResponse.status).json({
@@ -1232,25 +1314,61 @@ app.get('/api/github/fetch', async (req: Request, res: Response) => {
     }
 
     const treeData = await treeResponse.json();
-    return processGitHubTree(treeData, owner, repo, branch, res, headers);
-  } catch (err: any) {
-    console.error('Error fetching GitHub repository:', err);
-    res.status(500).json({ error: err.message || 'GitHub fetch failed' });
+    return await processGitHubTree(treeData, owner, repo, branch, res);
+  } catch (err: unknown) {
+    const status =
+      typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number'
+        ? err.status
+        : undefined;
+    console.error('Error fetching GitHub repository:', {
+      name: err instanceof Error ? err.name : 'UnknownError',
+      status,
+    });
+    res.status(500).json({ error: 'GitHub fetch failed.' });
   }
 });
+
+async function readLimitedText(response: globalThis.Response, maxBytes: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  while (totalBytes < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done || !value) break;
+
+    const chunk = value.subarray(0, maxBytes - totalBytes);
+    chunks.push(chunk);
+    totalBytes += chunk.byteLength;
+    if (chunk.byteLength < value.byteLength || totalBytes === maxBytes) {
+      await reader.cancel();
+    }
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
 
 async function processGitHubTree(
   treeData: any, 
   owner: string, 
   repo: string, 
   branch: string, 
-  res: Response,
-  headers: Record<string, string>
+  res: Response
 ) {
-  const tree = treeData.tree || [];
+  if (!treeData || !Array.isArray(treeData.tree)) {
+    return res.status(502).json({ error: 'GitHub returned an invalid repository tree.' });
+  }
+  const tree = treeData.tree;
   // Filter for code files, skip media, lockfiles, node_modules
   const validFiles = tree.filter((item: any) => {
-    if (item.type !== 'blob') return false;
+    if (!item || item.type !== 'blob' || typeof item.path !== 'string') return false;
     const p = item.path.toLowerCase();
     if (p.includes('node_modules/') || p.includes('.git/') || p.includes('dist/') || p.includes('build/')) return false;
     return /\.(ts|tsx|js|jsx|json|md|py|go|rs|css|html|yaml|yml|env\.example)$/.test(p);
@@ -1260,10 +1378,15 @@ async function processGitHubTree(
 
   for (const item of validFiles) {
     try {
-      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${item.path}`;
-      const rawRes = await fetch(rawUrl, { headers });
+      const encodedBranch = branch.split('/').map(encodeURIComponent).join('/');
+      const encodedPath = item.path.split('/').map(encodeURIComponent).join('/');
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${encodedBranch}/${encodedPath}`;
+      const rawRes = await fetch(rawUrl, {
+        headers: { 'User-Agent': 'RepoPilot-DevTool' },
+        signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
+      });
       if (rawRes.ok) {
-        const content = await rawRes.text();
+        const content = await readLimitedText(rawRes, MAX_GITHUB_FILE_BYTES);
         const ext = path.extname(item.path).replace('.', '');
         files.push({
           path: item.path,
@@ -1312,7 +1435,11 @@ async function startServer() {
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
 
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res, next) => {
+      if (req.path === '/api' || req.path.startsWith('/api/')) {
+        return next();
+      }
+
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
