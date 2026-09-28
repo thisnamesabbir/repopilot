@@ -1302,22 +1302,33 @@ async function startServer() {
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
+
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
+
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
+
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
 
   app.listen(PORT, () => {
-    console.log(`RepoPilot full-stack server running on http://localhost:${PORT}`);
+    console.log(
+      `RepoPilot full-stack server running on http://localhost:${PORT}`
+    );
     console.log(`Gemini API configured: ${Boolean(apiKey)}`);
   });
 }
 
-startServer();
+// Vercel handles the server itself.
+// Only start Express manually during local development.
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
