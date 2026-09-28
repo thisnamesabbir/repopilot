@@ -186,7 +186,7 @@ export default function Sidebar({ onOpenImportModal, isOpenMobile, onCloseMobile
         <div className="px-4 py-3 bg-slate-950/60 border-t border-slate-800/60 flex items-center justify-between text-[11px] text-slate-500 font-mono">
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span>gemini-3.1-flash-lite</span>
+            <span>gemini-2.5-flash</span>
           </div>
           <span>Node Proxy</span>
         </div>

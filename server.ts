@@ -15,20 +15,48 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const GITHUB_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_GITHUB_FILE_BYTES = 40_000;
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const FALLBACK_GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const GEMINI_MODEL_CANDIDATES = [DEFAULT_GEMINI_MODEL, FALLBACK_GEMINI_MODEL];
 
+app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
+app.use((req: Request, res: Response, next) => {
+  const origin = req.headers.origin;
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
+  const isAllowedOrigin = !origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin);
+
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', isAllowedOrigin ? origin || '*' : '');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    return res.status(204).end();
+  }
+
+  if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
+    return res.status(403).json({ success: false, error: 'Origin not allowed.' });
+  }
+
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
+  next();
+});
 app.use('/api', (req: Request, res: Response, next) => {
   if (
     req.method === 'POST' &&
     (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))
   ) {
-    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+    return res.status(400).json({ success: false, error: 'Request body must be a JSON object.' });
   }
 
   next();
 });
 
-const apiKey = process.env.GEMINI_API_KEY;
+const apiKey = process.env.GEMINI_API_KEY?.trim();
 let aiClient: GoogleGenAI | null = null;
 
 if (apiKey) {
@@ -36,10 +64,24 @@ if (apiKey) {
     apiKey,
     httpOptions: {
       headers: {
-        'User-Agent': 'aistudio-build',
+        'User-Agent': 'repo-pilot-server',
       },
     },
   });
+}
+
+function logApi(message: string, meta?: Record<string, unknown>) {
+  const payload = meta ? JSON.stringify(meta) : '';
+  console.log(`[API] ${message}${payload ? ` ${payload}` : ''}`);
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  return 'Unknown server error.';
 }
 
 function logGeminiFailure(error: unknown) {
@@ -49,9 +91,10 @@ function logGeminiFailure(error: unknown) {
       ? error.status
       : undefined;
 
-  console.error('Gemini API request failed:', {
-    name: error instanceof Error ? error.name : 'UnknownError',
+  console.error('[API] Gemini request failed', {
     status,
+    name: error instanceof Error ? error.name : 'UnknownError',
+    message: getErrorMessage(error).slice(0, 400),
   });
 }
 
@@ -76,10 +119,18 @@ function sanitizeRepoFiles(files: unknown): { path: string; content: string }[] 
 
 // Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
+  logApi('Health check requested', {
+    hasApiKey: Boolean(apiKey),
+    vercel: Boolean(process.env.VERCEL),
+    nodeEnv: process.env.NODE_ENV || 'development',
+  });
+
   res.json({
     status: 'ok',
     hasApiKey: Boolean(apiKey),
-    availableModels: ['gemini-3.1-flash-lite', 'gemini-3.8-flash'],
+    vercel: Boolean(process.env.VERCEL),
+    nodeEnv: process.env.NODE_ENV || 'development',
+    availableModels: GEMINI_MODEL_CANDIDATES,
     timestamp: Date.now(),
   });
 });
@@ -118,7 +169,7 @@ app.post('/api/repo/analyze', async (req: Request, res: Response) => {
       .join('\n\n');
 
     if (aiClient) {
-      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+      const modelsToTry = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
       for (const modelName of modelsToTry) {
         try {
           const prompt = `You are RepoPilot, a senior software architect analyzing a software repository named "${repoName}".
@@ -250,13 +301,20 @@ function searchRelevantFiles(files: any[], message: string): any[] {
 // FEATURE 2: AI Development Assistant Multi-Turn Chat
 app.post('/api/chat', async (req: Request, res: Response) => {
   try {
-    const { message, repoContext, history = [], taskType } = req.body;
+    const { message, repoContext, history = [], taskType } = req.body ?? {};
+
+    logApi('/api/chat request received', {
+      hasApiKey: Boolean(apiKey),
+      taskType: typeof taskType === 'string' ? taskType : 'general',
+      historyCount: Array.isArray(history) ? history.length : 0,
+      repoContextProvided: Boolean(repoContext && typeof repoContext === 'object'),
+    });
 
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      return res.status(400).json({ error: 'A valid non-empty message string is required.' });
+      return res.status(400).json({ success: false, error: 'A valid non-empty message string is required.' });
     }
     if (message.length > 10_000) {
-      return res.status(400).json({ error: 'Message must be at most 10000 characters.' });
+      return res.status(400).json({ success: false, error: 'Message must be at most 10000 characters.' });
     }
 
     const files = sanitizeRepoFiles(repoContext?.files);
@@ -327,8 +385,9 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     const relevantFiles = searchRelevantFiles(files, trimmedMsg);
     const isProtectedRoutesRequest = /protect(ed)?\s*route/i.test(trimmedMsg) && /dashboard/i.test(trimmedMsg);
 
-    // Determine appropriate Gemini models available in this environment
-    const fallbackModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    // Determine appropriate Gemini models available in this environment.
+    // Keep this to stable, broadly supported models to avoid runtime 400s from invalid model IDs.
+    const fallbackModels = GEMINI_MODEL_CANDIDATES;
 
     // If Gemini is available, query Gemini with multi-turn history and systemInstruction
     if (aiClient) {
@@ -441,6 +500,8 @@ Return ONLY valid JSON.`;
           const raw = response.text || '';
           const parsed = JSON.parse(raw);
 
+          logApi('Gemini response received', { model: modelToCall, source: 'chat' });
+
           // Support both changes and codeChanges, plan and implementationPlan
           const rawChanges = Array.isArray(parsed.changes) ? parsed.changes : (Array.isArray(parsed.codeChanges) ? parsed.codeChanges : []);
           const normalizedChanges = rawChanges.map((c: any) => {
@@ -499,12 +560,37 @@ Return ONLY valid JSON.`;
             userPrompt: trimmedMsg,
           };
 
-          return res.json({ plan: fullStructuredPlan, source: modelToCall });
+          return res.json({ success: true, plan: fullStructuredPlan, source: modelToCall });
         } catch (geminiError) {
           // Model temporarily unavailable or quota reached; proceed to next model or architecture fallback
           logGeminiFailure(geminiError);
         }
       }
+    }
+
+    if (!aiClient) {
+      const fallbackPlan = {
+        understanding: 'Gemini is not configured on this server. The app is operating in fallback mode.',
+        filesAffected: [],
+        plan: ['Configure GEMINI_API_KEY on the server and retry the request.'],
+        changes: [],
+        tests: ['Set the server-side GEMINI_API_KEY and rerun the assistant request.'],
+        security: ['Keep the API key on the server only and never expose it to the browser.'],
+        limitations: ['Gemini AI responses are unavailable because the server secret is missing.'],
+        confidence: 'low',
+        confidenceScore: 0,
+        confidenceReason: 'The server is missing GEMINI_API_KEY.',
+        insufficientContext: false,
+        missingContext: '',
+        workflowSteps: [],
+        implementationPlan: ['Configure GEMINI_API_KEY on the server and retry the request.'],
+        codeChanges: [],
+        testingPlan: ['Set the server-side GEMINI_API_KEY and rerun the assistant request.'],
+        securityConsiderations: ['Keep the API key on the server only and never expose it to the browser.'],
+        userPrompt: trimmedMsg,
+      };
+
+      return res.status(503).json({ success: false, error: 'Gemini is not configured. Set GEMINI_API_KEY on the server before using the AI Assistant.', plan: fallbackPlan });
     }
 
     // Codebase-aware deterministic response tailored for the hackathon flow
@@ -774,8 +860,9 @@ export default function App() {
 
     return res.json({ plan: genericPlan, source: 'repopilot-architect' });
   } catch (error: any) {
-    console.error('Error handling chat request:', error);
-    res.status(500).json({ error: error.message || 'Chat request failed.' });
+    const message = getErrorMessage(error);
+    console.error('[API] /api/chat failed', { message });
+    res.status(500).json({ success: false, error: message || 'Chat request failed.' });
   }
 });
 
@@ -789,7 +876,7 @@ app.post('/api/chat/explain-change', async (req: Request, res: Response) => {
     }
 
     if (aiClient) {
-      const fallbackModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+      const fallbackModels = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
       const systemInstruction = `You are RepoPilot, an elite software engineering copilot.
 Explain the specific code change and diff clearly, concisely, and technically for software engineers.
 Address:
@@ -897,7 +984,7 @@ app.post('/api/tests/analyze-error', async (req: Request, res: Response) => {
     const validFiles = sanitizeRepoFiles(files);
 
     if (aiClient) {
-      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+      const modelsToTry = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
       for (const modelToCall of modelsToTry) {
         try {
           const fileNames = validFiles.map((f: any) => f.path).join(', ');
@@ -1090,7 +1177,7 @@ app.post('/api/security/review', async (req: Request, res: Response) => {
     }
 
     if (aiClient) {
-      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+      const modelsToTry = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
       for (const modelToCall of modelsToTry) {
         try {
           const repoSnippet = validFiles

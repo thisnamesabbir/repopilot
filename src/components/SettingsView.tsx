@@ -56,7 +56,7 @@ export default function SettingsView() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
             <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 space-y-1">
               <span className="text-slate-500 font-mono text-[11px]">Selected Model:</span>
-              <p className="font-mono text-indigo-300 font-semibold">gemini-3.8-flash</p>
+              <p className="font-mono text-indigo-300 font-semibold">gemini-2.5-flash</p>
             </div>
             <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 space-y-1">
               <span className="text-slate-500 font-mono text-[11px]">API Key Boundary:</span>
